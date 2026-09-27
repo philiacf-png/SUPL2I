@@ -9,6 +9,7 @@ from model import load_checkpoint
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTDATA = os.path.join(os.path.dirname(HERE), "testdata")
 N_AUG = 8
+REPORT = {"archive": ("HV", "arch"), "front": ("front HV", "front"), "ws-archive": ("WS-archive HV", "ws_arch")}
 BIG = 1.0e6
 
 
@@ -24,6 +25,18 @@ def augment(xy):
 def cross_assign(best_obj, best_g, weights, ref_t):
     g = tcheb(best_obj[:, None, :, :], weights[None, :, None, :], ref_t)
     return g.min(dim=2)
+
+
+# WS-archive: every weight vector takes the archive point with the smallest weighted sum
+def ws_claim(nd, w, ref):
+    nd = np.asarray(nd, dtype=np.float64)
+    if len(nd) == 0:
+        return np.full((len(w), 2), BIG)
+    return nd[(w[:, None, :] * (nd[None, :, :] / np.asarray(ref))).sum(-1).argmin(1)]
+
+
+def nds_feasible(pts):
+    return len(pareto_filter_np(pts[(pts < BIG).all(1)]))
 
 
 @torch.inference_mode()
@@ -52,6 +65,7 @@ def improve(model, prob, depot, nodes, demand, rings, weights, ref, T, aug=False
     best_rec = torch.zeros(T_all, N, dtype=torch.long, device=device)
     arch_pts = [[] for _ in range(ne)]
     front_arch = np.zeros((G, W, 2))
+    w_np = weights.double().cpu().numpy()
     trace_steps = sorted({int(x) for x in (hv_steps or []) if 0 <= int(x) <= T})
     trace_idx = {t_: i for i, t_ in enumerate(trace_steps)}
     tr_obj = torch.zeros(len(trace_steps), T_all, 2)
@@ -151,21 +165,28 @@ def improve(model, prob, depot, nodes, demand, rings, weights, ref, T, aug=False
     a_best = fag.argmin(0)                                                       # (ne, W)
     front_arch_pts = fa[a_best, np.arange(ne)[:, None], np.arange(W)[None, :]]
     arch = [pareto_filter_np(np.concatenate(arch_pts[i], 0)) for i in range(ne)]
-    out = {"front_pts": front_pts, "front_arch_pts": front_arch_pts,
+    ws_arch = np.stack([ws_claim(arch[i], w_np, ref) for i in range(ne)])
+    out = {"front_pts": front_pts, "front_arch_pts": front_arch_pts, "ws_arch_pts": ws_arch,
            "front_hv": np.array([hv_norm(front_pts[i], ref) for i in range(ne)]),
            "front_arch_hv": np.array([hv_norm(front_arch_pts[i], ref) for i in range(ne)]),
+           "ws_arch_hv": np.array([hv_norm(ws_arch[i], ref) for i in range(ne)]),
+           "front_nds": np.array([nds_feasible(front_pts[i]) for i in range(ne)], dtype=float),
+           "ws_arch_nds": np.array([nds_feasible(ws_arch[i]) for i in range(ne)], dtype=float),
            "arch_hv": np.array([hv_norm(arch[i], ref) for i in range(ne)]),
            "arch_nds": np.array([len(arch[i]) for i in range(ne)], dtype=float),
-           "feasible_frac": float(ok.float().mean().item()), "infer_time_s": time.time() - t_start}
+           "infer_time_s": time.time() - t_start}
     if trace_steps:
         out["trace_steps"] = np.array(trace_steps)
         out["trace_front_hv"] = np.zeros((len(trace_steps), ne))
         out["trace_arch_hv"] = np.zeros((len(trace_steps), ne))
+        out["trace_ws_arch_hv"] = np.zeros((len(trace_steps), ne))
         for ti in range(len(trace_steps)):
             fp = select_front(tr_obj[ti].to(device), tr_g[ti].to(device))
             for i in range(ne):
                 out["trace_front_hv"][ti, i] = hv_norm(fp[i], ref)
                 out["trace_arch_hv"][ti, i] = hv_norm(np.concatenate(tr_arch_pts[i][ti], 0), ref)
+                nd = pareto_filter_np(np.concatenate(tr_arch_pts[i][ti], 0))
+                out["trace_ws_arch_hv"][ti, i] = hv_norm(ws_claim(nd, w_np, ref), ref)
     return out
 
 
@@ -190,7 +211,7 @@ def main():
     ap.add_argument("--n", type=int, default=100, help="number of customers")
     ap.add_argument("--ne", type=int, default=200, help="number of test instances")
     ap.add_argument("--T", type=int, default=1000, help="improvement steps per trajectory")
-    ap.add_argument("--n_sols", type=int, default=101, help="number of preference vectors")
+    ap.add_argument("--n_sols", type=int, default=101, help="number of weight vectors, one trajectory each")
     ap.add_argument("--elite_sharing", type=int, default=1, help="1 = elite sharing across trajectories")
     ap.add_argument("--sync_every", type=int, default=200, help="steps between elite-sharing rounds")
     ap.add_argument("--aug", type=int, default=0, help="1 = solve under 8 coordinate transformations")
@@ -200,12 +221,16 @@ def main():
     ap.add_argument("--rings", default="", help="start-ring file; default: random rings (seed 2024)")
     ap.add_argument("--ref", default="", help="reference point 'a,b'; default from the size table")
     ap.add_argument("--hv_steps", default="", help="record HV at these steps, e.g. '0,10-100:10,200-5000:100'")
+    ap.add_argument("--report", default="archive", choices=list(REPORT),
+                    help="reported set: archive (non-dominated set of all visited feasible solutions), "
+                         "front (best solution per weight vector), ws-archive (weighted-sum claim from the archive)")
     ap.add_argument("--save", default="", help="write per-instance results to this .npz file")
     ap.add_argument("--log_every", type=int, default=100)
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n = args.n
     ref = tuple(float(x) for x in args.ref.split(",")) if args.ref else REF[n]
+    assert args.n_sols >= 2, "--n_sols must be at least 2"
     prob = BiCVRP(n)
     weights = make_weights(args.n_sols, device=device)
     tfile = args.test_data or os.path.join(TESTDATA, f"test_bicvrp_n{n}.pt")
@@ -225,17 +250,17 @@ def main():
                   log_every=args.log_every)
     tag = f"aug{N_AUG}" if args.aug else "no-aug"
     sh = f"sharing every {args.sync_every}" if args.elite_sharing else "no sharing"
-    print(f"[eval] {os.path.basename(args.ckpt)} n={n} ne={args.ne} T={args.T} {tag} {sh} ref={ref} | "
-          f"front HV {res['front_hv'].mean():.4f} | archive-extracted front HV {res['front_arch_hv'].mean():.4f} | "
-          f"archive HV {res['arch_hv'].mean():.4f} | |ND| {res['arch_nds'].mean():.1f} | "
-          f"feasible {res['feasible_frac']:.3f} | {res['infer_time_s']:.0f}s")
+    label, key = REPORT[args.report]
+    print(f"[eval] {os.path.basename(args.ckpt)} n={n} ne={args.ne} T={args.T} W={args.n_sols} {tag} {sh} "
+          f"ref={ref} | {label} {res[key + '_hv'].mean():.4f} | |NDS| {res[key + '_nds'].mean():.1f}")
     if "trace_steps" in res:
-        print("  step  front_HV  archive_HV")
+        print(f"  step  {label}")
         for i, s in enumerate(res["trace_steps"]):
-            print(f"  {int(s):5d}  {res['trace_front_hv'][i].mean():.6f}  {res['trace_arch_hv'][i].mean():.6f}")
+            print(f"  {int(s):5d}  {res['trace_' + key + '_hv'][i].mean():.6f}")
     if args.save:
-        meta = dict(n=n, ne=args.ne, T=args.T, aug=int(args.aug), elite_sharing=int(args.elite_sharing),
-                    sync_every=args.sync_every, seed=args.seed, ref=np.asarray(ref), ckpt=os.path.basename(args.ckpt))
+        meta = dict(n=n, ne=args.ne, T=args.T, n_sols=args.n_sols, aug=int(args.aug),
+                    elite_sharing=int(args.elite_sharing), sync_every=args.sync_every, seed=args.seed,
+                    ref=np.asarray(ref), ckpt=os.path.basename(args.ckpt), report=args.report)
         np.savez(args.save, **res, **meta)
         print(f"[eval] saved -> {args.save}")
 

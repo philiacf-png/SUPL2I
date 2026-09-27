@@ -9,6 +9,7 @@ from model import load_checkpoint
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTDATA = os.path.join(os.path.dirname(HERE), "testdata")
 N_AUG = 8
+REPORT = {"archive": ("HV", "arch"), "front": ("front HV", "front"), "ws-archive": ("WS-archive HV", "ws_arch")}
 
 
 # instance augmentation: 8 distance-preserving transformations of the first objective's coordinates
@@ -23,6 +24,12 @@ def augment(inst):
 def cross_assign(best_obj, best_g, weights, ref_t):
     g = tcheb(best_obj[:, None, :, :], weights[None, :, None, :], ref_t)
     return g.min(dim=2)
+
+
+# WS-archive: every weight vector takes the archive point with the smallest weighted sum
+def ws_claim(nd, w, ref):
+    nd = np.asarray(nd, dtype=np.float64)
+    return nd[(w[:, None, :] * (nd[None, :, :] / np.asarray(ref))).sum(-1).argmin(1)]
 
 
 @torch.inference_mode()
@@ -49,10 +56,13 @@ def improve(model, prob, instances, tours, weights, ref, T, aug=False, elite_sha
     arch_hv = np.zeros(ne)
     arch_nds = np.zeros(ne)
     front_arch = np.zeros((ne, W, K))
+    ws_arch = np.zeros((ne, W, K))
+    w_np = weights.double().cpu().numpy()
     trace_steps = sorted({int(x) for x in (hv_steps or []) if 0 <= int(x) <= T})
     trace_idx = {t_: i for i, t_ in enumerate(trace_steps)}
     tr_front = np.zeros((len(trace_steps), ne))
     tr_arch = np.zeros((len(trace_steps), ne))
+    tr_ws = np.zeros((len(trace_steps), ne))
     if not elite_sharing:
         sync_every, temp_lo = 0, temp_hi
     n_chunks = (T_all + chunk - 1) // chunk
@@ -150,21 +160,27 @@ def improve(model, prob, instances, tours, weights, ref, T, aug=False, elite_sha
                     run = new_pts if run is None else np.concatenate([run, new_pts], 0)
                     run = pareto_filter_np(run)
                     tr_arch[ti, c0 // P + j] = hv_norm(run, ref)
+                    tr_ws[ti, c0 // P + j] = hv_norm(ws_claim(run, w_np, ref), ref)
                     prev = int(sp) + 1
             nd = nd_filter(pts).cpu().numpy()
             arch_hv[c0 // P + j] = hv_norm(nd, ref)
             arch_nds[c0 // P + j] = len(nd)
+            ws_arch[c0 // P + j] = ws_claim(nd, w_np, ref)
             gp = tcheb(pts[None, :, :], weights[:, None, :], ref_t)          # (W, |pts|)
             front_arch[c0 // P + j] = pts[gp.argmin(dim=1)].cpu().numpy()
     front_pts = select_front(best_obj.view(ne, P, K), best_g.view(ne, P))
-    out = {"front_pts": front_pts, "front_arch_pts": front_arch,
+    out = {"front_pts": front_pts, "front_arch_pts": front_arch, "ws_arch_pts": ws_arch,
            "front_hv": np.array([hv_norm(front_pts[i], ref) for i in range(ne)]),
            "front_arch_hv": np.array([hv_norm(front_arch[i], ref) for i in range(ne)]),
+           "ws_arch_hv": np.array([hv_norm(ws_arch[i], ref) for i in range(ne)]),
+           "front_nds": np.array([len(pareto_filter_np(front_pts[i])) for i in range(ne)], dtype=float),
+           "ws_arch_nds": np.array([len(pareto_filter_np(ws_arch[i])) for i in range(ne)], dtype=float),
            "arch_hv": arch_hv, "arch_nds": arch_nds, "infer_time_s": time.time() - t_start}
     if trace_steps:
         out["trace_steps"] = np.array(trace_steps)
         out["trace_front_hv"] = tr_front
         out["trace_arch_hv"] = tr_arch
+        out["trace_ws_arch_hv"] = tr_ws
     return out
 
 
@@ -189,7 +205,8 @@ def main():
     ap.add_argument("--n", type=int, default=100, help="problem size")
     ap.add_argument("--ne", type=int, default=200, help="number of test instances")
     ap.add_argument("--T", type=int, default=1000, help="improvement steps per trajectory")
-    ap.add_argument("--n_sols", type=int, default=105, help="number of preference vectors")
+    ap.add_argument("--n_sols", type=int, default=105,
+                    help="number of weight vectors, one trajectory each; a Das-Dennis size (..., 91, 105, 120, ...)")
     ap.add_argument("--elite_sharing", type=int, default=1, help="1 = elite sharing across trajectories")
     ap.add_argument("--sync_every", type=int, default=200, help="steps between elite-sharing rounds")
     ap.add_argument("--aug", type=int, default=0, help="1 = solve under 8 coordinate transformations")
@@ -200,6 +217,9 @@ def main():
     ap.add_argument("--tours", default="", help="start-tour file; default: random tours (seed 2024)")
     ap.add_argument("--ref", default="", help="reference point 'a,b,c'; default from the size table")
     ap.add_argument("--hv_steps", default="", help="record HV at these steps, e.g. '0,10-100:10,200-5000:100'")
+    ap.add_argument("--report", default="archive", choices=list(REPORT),
+                    help="reported set: archive (non-dominated set of all visited solutions), "
+                         "front (best solution per weight vector), ws-archive (weighted-sum claim from the archive)")
     ap.add_argument("--save", default="", help="write per-instance results to this .npz file")
     ap.add_argument("--log_every", type=int, default=100)
     args = ap.parse_args()
@@ -225,16 +245,17 @@ def main():
                   log_every=args.log_every)
     tag = f"aug{N_AUG}" if args.aug else "no-aug"
     sh = f"sharing every {args.sync_every}" if args.elite_sharing else "no sharing"
-    print(f"[eval] {os.path.basename(args.ckpt)} n={n} ne={args.ne} T={args.T} {tag} {sh} ref={ref} | "
-          f"front HV {res['front_hv'].mean():.4f} | archive-extracted front HV {res['front_arch_hv'].mean():.4f} | "
-          f"archive HV {res['arch_hv'].mean():.4f} | |ND| {res['arch_nds'].mean():.1f} | {res['infer_time_s']:.0f}s")
+    label, key = REPORT[args.report]
+    print(f"[eval] {os.path.basename(args.ckpt)} n={n} ne={args.ne} T={args.T} W={args.n_sols} {tag} {sh} "
+          f"ref={ref} | {label} {res[key + '_hv'].mean():.4f} | |NDS| {res[key + '_nds'].mean():.1f}")
     if "trace_steps" in res:
-        print("  step  front_HV  archive_HV")
+        print(f"  step  {label}")
         for i, s in enumerate(res["trace_steps"]):
-            print(f"  {int(s):5d}  {res['trace_front_hv'][i].mean():.6f}  {res['trace_arch_hv'][i].mean():.6f}")
+            print(f"  {int(s):5d}  {res['trace_' + key + '_hv'][i].mean():.6f}")
     if args.save:
-        meta = dict(n=n, ne=args.ne, T=args.T, aug=int(args.aug), elite_sharing=int(args.elite_sharing),
-                    sync_every=args.sync_every, seed=args.seed, ref=np.asarray(ref), ckpt=os.path.basename(args.ckpt))
+        meta = dict(n=n, ne=args.ne, T=args.T, n_sols=args.n_sols, aug=int(args.aug),
+                    elite_sharing=int(args.elite_sharing), sync_every=args.sync_every, seed=args.seed,
+                    ref=np.asarray(ref), ckpt=os.path.basename(args.ckpt), report=args.report)
         np.savez(args.save, **res, **meta)
         print(f"[eval] saved -> {args.save}")
 
