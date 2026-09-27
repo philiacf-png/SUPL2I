@@ -136,10 +136,15 @@ def train(args):
         best_hv, best_path, start_it = ck["best_hv"], ck.get("best_path"), ck["it"] + 1
         r = ck["rng"]
         torch.set_rng_state(r["torch"].cpu())
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and r["cuda"]:
             torch.cuda.set_rng_state_all([s.cpu() for s in r["cuda"]])
         np.random.set_state(r["numpy"])
-        gen.set_state(r["gen"].cpu())
+        g_state = r["gen"].cpu()
+        if g_state.numel() == gen.get_state().numel():
+            gen.set_state(g_state)
+        else:
+            gen.manual_seed(args.seed)
+            print("[resume] the checkpoint was written on a different device; the sampling stream restarts from --seed")
         print(f"[resume] {args.resume}: continuing from iteration {ck['it']} (epoch {ck['it'] // args.batches})")
     print(f"[init] SUPL2I | parameters {sum(p.numel() for p in model.parameters())} | sizes {args.sizes} | "
           f"{args.epochs} epochs x {args.batches} iterations", flush=True)

@@ -6,8 +6,7 @@ MOCVRP/     bi-objective CVRP
 testdata/   test instances
 ```
 
-Requirements: Python 3.10+, PyTorch 2.x (CUDA), NumPy; `hvwfg` is optional (exact hypervolume;
-a pure-numpy fallback is built in), `tensorboard` is optional (training curves).
+Requirements: Python 3.10+, PyTorch 2.x (CUDA), NumPy; `hvwfg` is to calculate hypervolume.
 Every problem directory is self-contained (`env.py`, `layers.py`, `model.py`, `train.py`, `eval.py`,
 `make_seeds.py`) and follows the same command line.
 
@@ -21,9 +20,9 @@ python train.py --resume checkpoints/supl2i-bitsp-last.pt   # continue an interr
 
 Progress is printed per iteration (`Epoch e/200 | iteration b/10`); every 100 iterations the
 model is evaluated on 25 random validation instances of sizes 20/50/100 and the best checkpoint 
-is saved as `checkpoints/supl2i-{bitsp,tritsp,bicvrp}-epoch-{E}.pt` (selection by the mean HV).
+is saved as `checkpoints/supl2i-{bitsp,tritsp,bicvrp}-epoch-<E>.pt` (selection by the mean HV).
 The final checkpoints are `bitsp/checkpoints/supl2i-bitsp-epoch-190.pt`,
-`tritsp/checkpoints/supl2i-tritsp-epoch-{E}.pt` and `MOCVRP/checkpoints/supl2i-bicvrp-epoch-{E}.pt`.
+`tritsp/checkpoints/supl2i-tritsp-epoch-190.pt` and `MOCVRP/checkpoints/supl2i-bicvrp-epoch-198.pt`.
 
 ## Inference
 
@@ -39,10 +38,10 @@ python eval.py --ckpt checkpoints/supl2i-bitsp-epoch-190.pt --n 100 \
     --test_data ../testdata/test_bitsp_KroAB_n100.pt --ne 1                                # a benchmark instance
 
 cd tritsp                                         # 105 preference vectors (Das-Dennis)
-python eval.py --ckpt checkpoints/supl2i-tritsp-epoch-{E}.pt --n 100
+python eval.py --ckpt checkpoints/supl2i-tritsp-epoch-190.pt --n 100
 
 cd MOCVRP                                         # feasible solutions only; every reported ring is re-verified
-python eval.py --ckpt checkpoints/supl2i-bicvrp-epoch-{E}.pt --n 100
+python eval.py --ckpt checkpoints/supl2i-bicvrp-epoch-198.pt --n 100
 ```
 
 Options: `--n` size, `--ne` number of instances, `--T` improvement steps, `--sync_every` elite-sharing
